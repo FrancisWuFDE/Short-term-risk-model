@@ -385,6 +385,12 @@ def _chunks(values: Sequence[T], size: int) -> Iterator[Sequence[T]]:
         yield values[start : start + size]
 
 
+def _print_batch_progress(label: str, batch: int, total: int) -> None:
+    """Print periodic progress without logging every Bloomberg request."""
+    if batch == 1 or batch % 10 == 0 or batch == total:
+        print(f"{label}: batch {batch}/{total}", flush=True)
+
+
 class BloombergClient:
     """Small synchronous wrapper around Bloomberg's Desktop API."""
 
@@ -462,7 +468,16 @@ class BloombergClient:
             raise RuntimeError("Bloomberg session has not been opened.")
 
         resolved: list[SecurityInfo] = []
-        for identifier_batch in _chunks(identifiers, self.batch_size):
+        total_batches = math.ceil(len(identifiers) / self.batch_size)
+        for batch_number, identifier_batch in enumerate(
+            _chunks(identifiers, self.batch_size),
+            start=1,
+        ):
+            _print_batch_progress(
+                "Resolving securities",
+                batch_number,
+                total_batches,
+            )
             request = self.service.createRequest("ReferenceDataRequest")
             securities_element = request.getElement("securities")
             for identifier in identifier_batch:
@@ -532,7 +547,13 @@ class BloombergClient:
         if not securities:
             return
 
-        for security_batch in _chunks(securities, self.batch_size):
+        total_batches = math.ceil(len(securities) / self.batch_size)
+        label = f"{field_name} {start_date} to {end_date}"
+        for batch_number, security_batch in enumerate(
+            _chunks(securities, self.batch_size),
+            start=1,
+        ):
+            _print_batch_progress(label, batch_number, total_batches)
             request = self.service.createRequest("HistoricalDataRequest")
             security_lookup = {
                 security.bloomberg_security: security for security in security_batch
@@ -596,7 +617,16 @@ class BloombergClient:
     ) -> list[PriceRow]:
         """Retrieve daily closing prices for each requested date window."""
         rows: list[PriceRow] = []
-        for start_date, end_date in windows:
+        price_windows = list(windows)
+        for window_number, (start_date, end_date) in enumerate(
+            price_windows,
+            start=1,
+        ):
+            print(
+                f"Price window {window_number}/{len(price_windows)}: "
+                f"{start_date} to {end_date}",
+                flush=True,
+            )
             for security, observation_date, value in self._historical_rows(
                 securities,
                 PRICE_FIELD,
@@ -611,6 +641,7 @@ class BloombergClient:
                         price=value,
                     )
                 )
+            print(f"Price rows collected: {len(rows):,}", flush=True)
         return rows
 
     def get_latest_short_interest(
@@ -622,6 +653,7 @@ class BloombergClient:
         """Retrieve each security's latest short-interest value on/before as-of."""
         latest: dict[str, ShortInterestRow] = {}
         recent_start_date = as_of_date - timedelta(days=lookback_days)
+        print("Retrieving short interest...", flush=True)
 
         def collect(targets: Sequence[SecurityInfo], start_date: date) -> None:
             for security, observation_date, value in self._historical_rows(
@@ -644,6 +676,11 @@ class BloombergClient:
             security for security in securities if security.ticker not in latest
         ]
         if missing and recent_start_date > date(1900, 1, 1):
+            print(
+                f"Retrying short interest history for {len(missing):,} "
+                "securities...",
+                flush=True,
+            )
             collect(missing, date(1900, 1, 1))
 
         for security in securities:
@@ -663,6 +700,7 @@ class BloombergClient:
         """Retrieve the latest market cap on or before the as-of date."""
         latest: dict[str, MarketCapRow] = {}
         start_date = as_of_date - timedelta(days=MARKET_CAP_LOOKBACK_DAYS)
+        print("Retrieving market caps...", flush=True)
         for security, observation_date, value in self._historical_rows(
             securities,
             MARKET_CAP_FIELD,
@@ -876,7 +914,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
         windows = historical_price_windows(workbook_input.as_of_date)
         print(
             f"Loaded {len(workbook_input.identifiers)} securities; data date "
-            f"{workbook_input.as_of_date}."
+            f"{workbook_input.as_of_date}.",
+            flush=True,
         )
 
         with BloombergClient(
@@ -889,7 +928,8 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 raise RuntimeError("Bloomberg could not resolve any input securities.")
             print(
                 f"Resolved {len(securities)} of "
-                f"{len(workbook_input.identifiers)} securities."
+                f"{len(workbook_input.identifiers)} securities.",
+                flush=True,
             )
             prices = client.get_prices(securities, windows)
             short_interest = client.get_latest_short_interest(
@@ -897,11 +937,20 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 workbook_input.as_of_date,
                 options.short_interest_lookback_days,
             )
+            print(
+                f"Short-interest rows collected: {len(short_interest):,}",
+                flush=True,
+            )
             market_caps = client.get_market_caps(
                 securities,
                 workbook_input.as_of_date,
             )
+            print(
+                f"Market-cap rows collected: {len(market_caps):,}",
+                flush=True,
+            )
 
+        print(f"Saving data to {options.database}...", flush=True)
         store_rows(options.database, prices, short_interest, market_caps)
         print(
             f"Stored {len(prices)} price rows and {len(short_interest)} "
