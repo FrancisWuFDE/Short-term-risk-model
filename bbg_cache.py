@@ -152,6 +152,11 @@ def _parse_date(value: str) -> date | None:
     return _excel_serial_to_date(cleaned)
 
 
+def _bloomberg_date(value: date | datetime) -> date:
+    """Normalize Bloomberg date and datetime values to a date."""
+    return value.date() if isinstance(value, datetime) else value
+
+
 def _shared_strings(archive: zipfile.ZipFile) -> list[str]:
     """Return the workbook's shared-string table, if present."""
     path = "xl/sharedStrings.xml"
@@ -569,7 +574,9 @@ class BloombergClient:
                     field_element = field_data.getElement(field_name)
                     if field_element.isNull():
                         continue
-                    observation_date = field_data.getElementAsDatetime("date").date()
+                    observation_date = _bloomberg_date(
+                        field_data.getElementAsDatetime("date")
+                    )
                     try:
                         value = field_element.getValueAsFloat()
                     except (TypeError, ValueError):
