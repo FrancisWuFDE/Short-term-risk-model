@@ -29,7 +29,7 @@ TICKER_FIELD = "TICKER_AND_EXCH_CODE"
 BICS_INDUSTRY_FIELD = "BICS_LEVEL_3_INDUSTRY_NAME"
 SHORT_INTEREST_FIELD = "SI_PERCENT_EQUITY_FLOAT"
 MARKET_CAP_FIELD = "CUR_MKT_CAP"
-MARKET_CAP_LOOKBACK_DAYS = 31
+POINT_IN_TIME_LOOKBACK_DAYS = 21
 
 FIGI_PATTERN = re.compile(r"^BBG[A-Z0-9]{9}$", re.IGNORECASE)
 FIGI_HEADERS = {
@@ -102,6 +102,16 @@ class MarketCapRow:
     ticker: str
     industry: str
     market_cap: float
+
+
+@dataclass(frozen=True)
+class DownloadCoverage:
+    """A successfully completed Bloomberg field request for one security."""
+
+    field: str
+    ticker: str
+    start_date: date
+    end_date: date
 
 
 def _load_blpapi() -> Any:
@@ -379,6 +389,20 @@ def historical_price_windows(as_of_date: date) -> list[tuple[date, date]]:
     return windows
 
 
+def _weekday_on_or_after(value: date) -> date:
+    """Return the first weekday on or after a date."""
+    while value.weekday() >= 5:
+        value += timedelta(days=1)
+    return value
+
+
+def _weekday_on_or_before(value: date) -> date:
+    """Return the last weekday on or before a date."""
+    while value.weekday() >= 5:
+        value -= timedelta(days=1)
+    return value
+
+
 def _chunks(values: Sequence[T], size: int) -> Iterator[Sequence[T]]:
     """Yield fixed-size slices from a sequence."""
     for start in range(0, len(values), size):
@@ -399,6 +423,7 @@ class BloombergClient:
         host: str = "localhost",
         port: int = 8194,
         batch_size: int = 50,
+        database_path: Path = Path("bloomberg_history.db"),
     ) -> None:
         self.blpapi = _load_blpapi()
         options = self.blpapi.SessionOptions()
@@ -407,6 +432,8 @@ class BloombergClient:
         self.session = self.blpapi.Session(options)
         self.service: Any | None = None
         self.batch_size = batch_size
+        self.database_path = database_path
+        self.completed_downloads: list[DownloadCoverage] = []
 
     def __enter__(self) -> BloombergClient:
         if not self.session.start():
@@ -547,10 +574,30 @@ class BloombergClient:
         if not securities:
             return
 
-        total_batches = math.ceil(len(securities) / self.batch_size)
+        covered_tickers = load_covered_tickers(
+            self.database_path,
+            field_name,
+            start_date,
+            end_date,
+        )
+        pending = [
+            security
+            for security in securities
+            if security.ticker not in covered_tickers
+        ]
+        if covered_tickers:
+            print(
+                f"{field_name} {start_date} to {end_date}: skipped "
+                f"{len(securities) - len(pending):,} cached securities",
+                flush=True,
+            )
+        if not pending:
+            return
+
+        total_batches = math.ceil(len(pending) / self.batch_size)
         label = f"{field_name} {start_date} to {end_date}"
         for batch_number, security_batch in enumerate(
-            _chunks(securities, self.batch_size),
+            _chunks(pending, self.batch_size),
             start=1,
         ):
             _print_batch_progress(label, batch_number, total_batches)
@@ -567,6 +614,8 @@ class BloombergClient:
             request.set("periodicitySelection", "DAILY")
             request.set("nonTradingDayFillOption", "ACTIVE_DAYS_ONLY")
 
+            completed_tickers: set[str] = set()
+            batch_rows: list[tuple[SecurityInfo, date, float]] = []
             for message in self._response_messages(request):
                 if not message.hasElement("securityData"):
                     continue
@@ -588,6 +637,18 @@ class BloombergClient:
                         file=sys.stderr,
                     )
                     continue
+                if (
+                    security_data.hasElement("fieldExceptions")
+                    and security_data.getElement("fieldExceptions").numValues() > 0
+                ):
+                    print(
+                        f"ERROR: Bloomberg returned a field error for "
+                        f"{security.input_identifier}: "
+                        f"{security_data.getElement('fieldExceptions')}",
+                        file=sys.stderr,
+                    )
+                    continue
+                completed_tickers.add(security.ticker)
 
                 for field_data in security_data.getElement("fieldData").values():
                     if not field_data.hasElement(field_name):
@@ -608,7 +669,24 @@ class BloombergClient:
                         )
                         continue
                     if math.isfinite(value):
-                        yield security, observation_date, value
+                        batch_rows.append((security, observation_date, value))
+            coverage_rows = [
+                DownloadCoverage(
+                    field=field_name,
+                    ticker=ticker,
+                    start_date=start_date,
+                    end_date=end_date,
+                )
+                for ticker in completed_tickers
+            ]
+            store_download_batch(
+                self.database_path,
+                field_name,
+                batch_rows,
+                coverage_rows,
+            )
+            self.completed_downloads.extend(coverage_rows)
+            yield from batch_rows
 
     def get_prices(
         self,
@@ -648,11 +726,27 @@ class BloombergClient:
         self,
         securities: Sequence[SecurityInfo],
         as_of_date: date,
-        lookback_days: int,
     ) -> list[ShortInterestRow]:
         """Retrieve each security's latest short-interest value on/before as-of."""
-        latest: dict[str, ShortInterestRow] = {}
-        recent_start_date = as_of_date - timedelta(days=lookback_days)
+        recent_start_date = as_of_date - timedelta(
+            days=POINT_IN_TIME_LOOKBACK_DAYS
+        )
+        covered_tickers = load_covered_tickers(
+            self.database_path,
+            SHORT_INTEREST_FIELD,
+            recent_start_date,
+            as_of_date,
+        )
+        latest = load_existing_short_interest(
+            self.database_path,
+            securities,
+            as_of_date,
+        )
+        latest = {
+            ticker: row
+            for ticker, row in latest.items()
+            if ticker in covered_tickers
+        }
         print("Retrieving short interest...", flush=True)
 
         def collect(targets: Sequence[SecurityInfo], start_date: date) -> None:
@@ -671,23 +765,23 @@ class BloombergClient:
                         short_interest_percent_float=value,
                     )
 
-        collect(securities, recent_start_date)
-        missing = [
+        targets = [
             security for security in securities if security.ticker not in latest
         ]
-        if missing and recent_start_date > date(1900, 1, 1):
+        if latest:
             print(
-                f"Retrying short interest history for {len(missing):,} "
-                "securities...",
+                f"Short interest: skipped {len(securities) - len(targets):,} "
+                "securities already in the database",
                 flush=True,
             )
-            collect(missing, date(1900, 1, 1))
+        collect(targets, recent_start_date)
 
         for security in securities:
             if security.ticker not in latest:
                 print(
                     f"WARNING: No {SHORT_INTEREST_FIELD} observation found for "
-                    f"{security.ticker} through {as_of_date}.",
+                    f"{security.ticker} in the {POINT_IN_TIME_LOOKBACK_DAYS} "
+                    f"calendar days through {as_of_date}.",
                     file=sys.stderr,
                 )
         return list(latest.values())
@@ -698,11 +792,35 @@ class BloombergClient:
         as_of_date: date,
     ) -> list[MarketCapRow]:
         """Retrieve the latest market cap on or before the as-of date."""
-        latest: dict[str, MarketCapRow] = {}
-        start_date = as_of_date - timedelta(days=MARKET_CAP_LOOKBACK_DAYS)
-        print("Retrieving market caps...", flush=True)
-        for security, observation_date, value in self._historical_rows(
+        start_date = as_of_date - timedelta(days=POINT_IN_TIME_LOOKBACK_DAYS)
+        covered_tickers = load_covered_tickers(
+            self.database_path,
+            MARKET_CAP_FIELD,
+            start_date,
+            as_of_date,
+        )
+        latest = load_existing_market_caps(
+            self.database_path,
             securities,
+            as_of_date,
+        )
+        latest = {
+            ticker: row
+            for ticker, row in latest.items()
+            if ticker in covered_tickers
+        }
+        print("Retrieving market caps...", flush=True)
+        targets = [
+            security for security in securities if security.ticker not in latest
+        ]
+        if latest:
+            print(
+                f"Market caps: skipped {len(securities) - len(targets):,} "
+                "securities already in the database",
+                flush=True,
+            )
+        for security, observation_date, value in self._historical_rows(
+            targets,
             MARKET_CAP_FIELD,
             start_date,
             as_of_date,
@@ -720,7 +838,8 @@ class BloombergClient:
             if security.ticker not in latest:
                 print(
                     f"WARNING: No {MARKET_CAP_FIELD} observation found for "
-                    f"{security.ticker} in the {MARKET_CAP_LOOKBACK_DAYS} days "
+                    f"{security.ticker} in the {POINT_IN_TIME_LOOKBACK_DAYS} "
+                    "calendar days "
                     f"through {as_of_date}.",
                     file=sys.stderr,
                 )
@@ -755,14 +874,259 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             PRIMARY KEY (date, ticker)
         );
 
+        CREATE TABLE IF NOT EXISTS security_metadata (
+            input_identifier TEXT PRIMARY KEY,
+            bloomberg_security TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            industry TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS download_coverage (
+            field TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            start_date TEXT NOT NULL,
+            end_date TEXT NOT NULL,
+            PRIMARY KEY (field, ticker, start_date, end_date)
+        );
+
         CREATE INDEX IF NOT EXISTS idx_prices_ticker_date
             ON prices (ticker, date);
         CREATE INDEX IF NOT EXISTS idx_short_interest_ticker_date
             ON short_interest (ticker, date);
         CREATE INDEX IF NOT EXISTS idx_market_caps_ticker_date
             ON market_caps (ticker, date);
+        CREATE INDEX IF NOT EXISTS idx_download_coverage_lookup
+            ON download_coverage (field, ticker, start_date, end_date);
         """
     )
+
+
+def load_cached_securities(
+    database_path: Path,
+    identifiers: Sequence[str],
+) -> tuple[list[SecurityInfo], list[str]]:
+    """Return cached security metadata and identifiers still needing resolution."""
+    with closing(sqlite3.connect(database_path)) as connection:
+        initialize_database(connection)
+        rows = connection.execute(
+            """
+            SELECT input_identifier, bloomberg_security, ticker, industry
+            FROM security_metadata
+            """
+        )
+        cached_by_identifier = {
+            row[0]: SecurityInfo(*row) for row in rows
+        }
+    cached = [
+        cached_by_identifier[identifier]
+        for identifier in identifiers
+        if identifier in cached_by_identifier
+    ]
+    missing = [
+        identifier for identifier in identifiers if identifier not in cached_by_identifier
+    ]
+    return cached, missing
+
+
+def store_security_metadata(
+    database_path: Path,
+    securities: Sequence[SecurityInfo],
+) -> None:
+    """Upsert resolved Bloomberg security metadata."""
+    with closing(sqlite3.connect(database_path)) as connection:
+        with connection:
+            initialize_database(connection)
+            connection.executemany(
+                """
+                INSERT INTO security_metadata (
+                    input_identifier,
+                    bloomberg_security,
+                    ticker,
+                    industry
+                )
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT (input_identifier) DO UPDATE SET
+                    bloomberg_security = excluded.bloomberg_security,
+                    ticker = excluded.ticker,
+                    industry = excluded.industry
+                """,
+                (
+                    (
+                        security.input_identifier,
+                        security.bloomberg_security,
+                        security.ticker,
+                        security.industry,
+                    )
+                    for security in securities
+                ),
+            )
+
+
+def load_covered_tickers(
+    database_path: Path,
+    field: str,
+    start_date: date,
+    end_date: date,
+) -> set[str]:
+    """Return tickers with cached coverage encompassing a requested window."""
+    with closing(sqlite3.connect(database_path)) as connection:
+        initialize_database(connection)
+        rows = connection.execute(
+            """
+            SELECT ticker
+            FROM download_coverage
+            WHERE field = ? AND start_date <= ? AND end_date >= ?
+            """,
+            (field, start_date.isoformat(), end_date.isoformat()),
+        )
+        return {row[0] for row in rows}
+
+
+def migrate_existing_download_coverage(
+    database_path: Path,
+    windows: Sequence[tuple[date, date]],
+    as_of_date: date,
+) -> int:
+    """Register completed requests represented by legacy database rows."""
+    migrated = 0
+    with closing(sqlite3.connect(database_path)) as connection:
+        with connection:
+            initialize_database(connection)
+            for start_date, end_date in windows:
+                first_weekday = _weekday_on_or_after(start_date).isoformat()
+                last_weekday = _weekday_on_or_before(end_date).isoformat()
+                before = connection.total_changes
+                connection.execute(
+                    """
+                    INSERT OR IGNORE INTO download_coverage (
+                        field,
+                        ticker,
+                        start_date,
+                        end_date
+                    )
+                    SELECT ?, ticker, ?, ?
+                    FROM prices
+                    WHERE date BETWEEN ? AND ?
+                    GROUP BY ticker
+                    HAVING MIN(date) <= ? AND MAX(date) >= ?
+                    """,
+                    (
+                        PRICE_FIELD,
+                        start_date.isoformat(),
+                        end_date.isoformat(),
+                        start_date.isoformat(),
+                        end_date.isoformat(),
+                        first_weekday,
+                        last_weekday,
+                    ),
+                )
+                migrated += connection.total_changes - before
+
+            snapshot_row = connection.execute(
+                "SELECT MAX(date) FROM market_caps"
+            ).fetchone()
+            snapshot_date = snapshot_row[0] if snapshot_row else None
+            if snapshot_date != as_of_date.isoformat():
+                return migrated
+
+            point_fields = (
+                (
+                    SHORT_INTEREST_FIELD,
+                    "short_interest",
+                    as_of_date - timedelta(days=POINT_IN_TIME_LOOKBACK_DAYS),
+                ),
+                (
+                    MARKET_CAP_FIELD,
+                    "market_caps",
+                    as_of_date - timedelta(days=POINT_IN_TIME_LOOKBACK_DAYS),
+                ),
+            )
+            for field, table, start_date in point_fields:
+                before = connection.total_changes
+                connection.execute(
+                    f"""
+                    INSERT OR IGNORE INTO download_coverage (
+                        field,
+                        ticker,
+                        start_date,
+                        end_date
+                    )
+                    SELECT ?, ticker, ?, ?
+                    FROM {table}
+                    WHERE date <= ?
+                    GROUP BY ticker
+                    """,
+                    (
+                        field,
+                        start_date.isoformat(),
+                        as_of_date.isoformat(),
+                        as_of_date.isoformat(),
+                    ),
+                )
+                migrated += connection.total_changes - before
+    return migrated
+
+
+def load_existing_short_interest(
+    database_path: Path,
+    securities: Sequence[SecurityInfo],
+    as_of_date: date,
+) -> dict[str, ShortInterestRow]:
+    """Load the latest stored short-interest row for requested securities."""
+    security_by_ticker = {security.ticker: security for security in securities}
+    latest: dict[str, ShortInterestRow] = {}
+    start_date = as_of_date - timedelta(days=POINT_IN_TIME_LOOKBACK_DAYS)
+    with closing(sqlite3.connect(database_path)) as connection:
+        initialize_database(connection)
+        rows = connection.execute(
+            """
+            SELECT date, ticker, industry, short_interest_percent_float
+            FROM short_interest
+            WHERE date BETWEEN ? AND ?
+            ORDER BY date DESC
+            """,
+            (start_date.isoformat(), as_of_date.isoformat()),
+        )
+        for observation_date, ticker, industry, value in rows:
+            if ticker in security_by_ticker and ticker not in latest:
+                latest[ticker] = ShortInterestRow(
+                    observation_date=date.fromisoformat(observation_date),
+                    ticker=ticker,
+                    industry=industry,
+                    short_interest_percent_float=value,
+                )
+    return latest
+
+
+def load_existing_market_caps(
+    database_path: Path,
+    securities: Sequence[SecurityInfo],
+    as_of_date: date,
+) -> dict[str, MarketCapRow]:
+    """Load the latest stored market-cap row for requested securities."""
+    security_by_ticker = {security.ticker: security for security in securities}
+    latest: dict[str, MarketCapRow] = {}
+    start_date = as_of_date - timedelta(days=POINT_IN_TIME_LOOKBACK_DAYS)
+    with closing(sqlite3.connect(database_path)) as connection:
+        initialize_database(connection)
+        rows = connection.execute(
+            """
+            SELECT date, ticker, industry, market_cap
+            FROM market_caps
+            WHERE date BETWEEN ? AND ?
+            ORDER BY date DESC
+            """,
+            (start_date.isoformat(), as_of_date.isoformat()),
+        )
+        for observation_date, ticker, industry, value in rows:
+            if ticker in security_by_ticker and ticker not in latest:
+                latest[ticker] = MarketCapRow(
+                    observation_date=date.fromisoformat(observation_date),
+                    ticker=ticker,
+                    industry=industry,
+                    market_cap=value,
+                )
+    return latest
 
 
 def store_rows(
@@ -770,6 +1134,7 @@ def store_rows(
     price_rows: Sequence[PriceRow],
     short_interest_rows: Sequence[ShortInterestRow],
     market_cap_rows: Sequence[MarketCapRow] = (),
+    download_coverage: Sequence[DownloadCoverage] = (),
 ) -> None:
     """Upsert retrieved Bloomberg observations into SQLite atomically."""
     database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -835,6 +1200,75 @@ def store_rows(
                     for row in short_interest_rows
                 ),
             )
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO download_coverage (
+                    field,
+                    ticker,
+                    start_date,
+                    end_date
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    (
+                        row.field,
+                        row.ticker,
+                        row.start_date.isoformat(),
+                        row.end_date.isoformat(),
+                    )
+                    for row in download_coverage
+                ),
+            )
+
+
+def store_download_batch(
+    database_path: Path,
+    field: str,
+    rows: Sequence[tuple[SecurityInfo, date, float]],
+    coverage: Sequence[DownloadCoverage],
+) -> None:
+    """Persist one completed Bloomberg batch and its coverage immediately."""
+    price_rows: list[PriceRow] = []
+    short_interest_rows: list[ShortInterestRow] = []
+    market_cap_rows: list[MarketCapRow] = []
+
+    for security, observation_date, value in rows:
+        if field == PRICE_FIELD:
+            price_rows.append(
+                PriceRow(
+                    observation_date,
+                    security.ticker,
+                    security.industry,
+                    value,
+                )
+            )
+        elif field == SHORT_INTEREST_FIELD:
+            short_interest_rows.append(
+                ShortInterestRow(
+                    observation_date,
+                    security.ticker,
+                    security.industry,
+                    value,
+                )
+            )
+        elif field == MARKET_CAP_FIELD:
+            market_cap_rows.append(
+                MarketCapRow(
+                    observation_date,
+                    security.ticker,
+                    security.industry,
+                    value,
+                )
+            )
+
+    store_rows(
+        database_path,
+        price_rows,
+        short_interest_rows,
+        market_cap_rows,
+        coverage,
+    )
 
 
 def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespace:
@@ -871,15 +1305,6 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
         help="Bloomberg Desktop API port (default: 8194).",
     )
     parser.add_argument(
-        "--short-interest-lookback-days",
-        type=int,
-        default=730,
-        help=(
-            "Initial days to search backward for short interest; securities with "
-            "no result are retried from 1900 (default: 730)."
-        ),
-    )
-    parser.add_argument(
         "--batch-size",
         type=int,
         default=50,
@@ -894,8 +1319,6 @@ def parse_arguments(arguments: Sequence[str] | None = None) -> argparse.Namespac
         ),
     )
     parsed = parser.parse_args(arguments)
-    if parsed.short_interest_lookback_days <= 0:
-        parser.error("--short-interest-lookback-days must be positive")
     if not 1 <= parsed.port <= 65_535:
         parser.error("--port must be between 1 and 65535")
     if parsed.batch_size <= 0:
@@ -912,18 +1335,42 @@ def main(arguments: Sequence[str] | None = None) -> int:
             ticker_suffix=options.ticker_suffix,
         )
         windows = historical_price_windows(workbook_input.as_of_date)
+        options.database.parent.mkdir(parents=True, exist_ok=True)
+        migrated_coverage = migrate_existing_download_coverage(
+            options.database,
+            windows,
+            workbook_input.as_of_date,
+        )
+        cached_securities, unresolved_identifiers = load_cached_securities(
+            options.database,
+            workbook_input.identifiers,
+        )
         print(
             f"Loaded {len(workbook_input.identifiers)} securities; data date "
             f"{workbook_input.as_of_date}.",
             flush=True,
         )
+        if migrated_coverage:
+            print(
+                f"Recognized {migrated_coverage:,} existing price-window "
+                "and point-in-time downloads in the database.",
+                flush=True,
+            )
+        if cached_securities:
+            print(
+                f"Loaded {len(cached_securities):,} resolved securities from cache.",
+                flush=True,
+            )
 
         with BloombergClient(
             host=options.host,
             port=options.port,
             batch_size=options.batch_size,
+            database_path=options.database,
         ) as client:
-            securities = client.resolve_securities(workbook_input.identifiers)
+            resolved_securities = client.resolve_securities(unresolved_identifiers)
+            store_security_metadata(options.database, resolved_securities)
+            securities = cached_securities + resolved_securities
             if not securities:
                 raise RuntimeError("Bloomberg could not resolve any input securities.")
             print(
@@ -935,7 +1382,6 @@ def main(arguments: Sequence[str] | None = None) -> int:
             short_interest = client.get_latest_short_interest(
                 securities,
                 workbook_input.as_of_date,
-                options.short_interest_lookback_days,
             )
             print(
                 f"Short-interest rows collected: {len(short_interest):,}",
@@ -951,7 +1397,13 @@ def main(arguments: Sequence[str] | None = None) -> int:
             )
 
         print(f"Saving data to {options.database}...", flush=True)
-        store_rows(options.database, prices, short_interest, market_caps)
+        store_rows(
+            options.database,
+            prices,
+            short_interest,
+            market_caps,
+            client.completed_downloads,
+        )
         print(
             f"Stored {len(prices)} price rows and {len(short_interest)} "
             f"short-interest rows and {len(market_caps)} market-cap rows in "
