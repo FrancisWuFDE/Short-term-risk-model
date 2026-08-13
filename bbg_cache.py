@@ -29,7 +29,7 @@ TICKER_FIELD = "TICKER_AND_EXCH_CODE"
 BICS_INDUSTRY_FIELD = "BICS_LEVEL_3_INDUSTRY_NAME"
 SHORT_INTEREST_FIELD = "SI_PERCENT_EQUITY_FLOAT"
 MARKET_CAP_FIELD = "CUR_MKT_CAP"
-POINT_IN_TIME_LOOKBACK_DAYS = 21
+SHORT_INTEREST_LOOKBACK_DAYS = 21
 
 FIGI_PATTERN = re.compile(r"^BBG[A-Z0-9]{9}$", re.IGNORECASE)
 FIGI_HEADERS = {
@@ -90,7 +90,6 @@ class ShortInterestRow:
 
     observation_date: date
     ticker: str
-    industry: str
     short_interest_percent_float: float
 
 
@@ -100,7 +99,6 @@ class MarketCapRow:
 
     observation_date: date
     ticker: str
-    industry: str
     market_cap: float
 
 
@@ -727,14 +725,12 @@ class BloombergClient:
         securities: Sequence[SecurityInfo],
         as_of_date: date,
     ) -> list[ShortInterestRow]:
-        """Retrieve each security's latest short-interest value on/before as-of."""
-        recent_start_date = as_of_date - timedelta(
-            days=POINT_IN_TIME_LOOKBACK_DAYS
-        )
+        """Retrieve the latest short interest within 21 calendar days."""
+        start_date = as_of_date - timedelta(days=SHORT_INTEREST_LOOKBACK_DAYS)
         covered_tickers = load_covered_tickers(
             self.database_path,
             SHORT_INTEREST_FIELD,
-            recent_start_date,
+            start_date,
             as_of_date,
         )
         latest = load_existing_short_interest(
@@ -749,22 +745,6 @@ class BloombergClient:
         }
         print("Retrieving short interest...", flush=True)
 
-        def collect(targets: Sequence[SecurityInfo], start_date: date) -> None:
-            for security, observation_date, value in self._historical_rows(
-                targets,
-                SHORT_INTEREST_FIELD,
-                start_date,
-                as_of_date,
-            ):
-                existing = latest.get(security.ticker)
-                if existing is None or observation_date > existing.observation_date:
-                    latest[security.ticker] = ShortInterestRow(
-                        observation_date=observation_date,
-                        ticker=security.ticker,
-                        industry=security.industry,
-                        short_interest_percent_float=value,
-                    )
-
         targets = [
             security for security in securities if security.ticker not in latest
         ]
@@ -774,13 +754,25 @@ class BloombergClient:
                 "securities already in the database",
                 flush=True,
             )
-        collect(targets, recent_start_date)
+        for security, observation_date, value in self._historical_rows(
+            targets,
+            SHORT_INTEREST_FIELD,
+            start_date,
+            as_of_date,
+        ):
+            existing = latest.get(security.ticker)
+            if existing is None or observation_date > existing.observation_date:
+                latest[security.ticker] = ShortInterestRow(
+                    observation_date=observation_date,
+                    ticker=security.ticker,
+                    short_interest_percent_float=value,
+                )
 
         for security in securities:
             if security.ticker not in latest:
                 print(
                     f"WARNING: No {SHORT_INTEREST_FIELD} observation found for "
-                    f"{security.ticker} in the {POINT_IN_TIME_LOOKBACK_DAYS} "
+                    f"{security.ticker} in the {SHORT_INTEREST_LOOKBACK_DAYS} "
                     f"calendar days through {as_of_date}.",
                     file=sys.stderr,
                 )
@@ -791,12 +783,11 @@ class BloombergClient:
         securities: Sequence[SecurityInfo],
         as_of_date: date,
     ) -> list[MarketCapRow]:
-        """Retrieve the latest market cap on or before the as-of date."""
-        start_date = as_of_date - timedelta(days=POINT_IN_TIME_LOOKBACK_DAYS)
+        """Retrieve each security's market cap on the as-of date."""
         covered_tickers = load_covered_tickers(
             self.database_path,
             MARKET_CAP_FIELD,
-            start_date,
+            as_of_date,
             as_of_date,
         )
         latest = load_existing_market_caps(
@@ -822,7 +813,7 @@ class BloombergClient:
         for security, observation_date, value in self._historical_rows(
             targets,
             MARKET_CAP_FIELD,
-            start_date,
+            as_of_date,
             as_of_date,
         ):
             existing = latest.get(security.ticker)
@@ -830,7 +821,6 @@ class BloombergClient:
                 latest[security.ticker] = MarketCapRow(
                     observation_date=observation_date,
                     ticker=security.ticker,
-                    industry=security.industry,
                     market_cap=value,
                 )
 
@@ -838,9 +828,7 @@ class BloombergClient:
             if security.ticker not in latest:
                 print(
                     f"WARNING: No {MARKET_CAP_FIELD} observation found for "
-                    f"{security.ticker} in the {POINT_IN_TIME_LOOKBACK_DAYS} "
-                    "calendar days "
-                    f"through {as_of_date}.",
+                    f"{security.ticker} on {as_of_date}.",
                     file=sys.stderr,
                 )
         return list(latest.values())
@@ -861,7 +849,6 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS short_interest (
             date TEXT NOT NULL,
             ticker TEXT NOT NULL,
-            industry TEXT NOT NULL,
             short_interest_percent_float REAL NOT NULL,
             PRIMARY KEY (date, ticker)
         );
@@ -869,7 +856,6 @@ def initialize_database(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS market_caps (
             date TEXT NOT NULL,
             ticker TEXT NOT NULL,
-            industry TEXT NOT NULL,
             market_cap REAL NOT NULL,
             PRIMARY KEY (date, ticker)
         );
@@ -899,6 +885,12 @@ def initialize_database(connection: sqlite3.Connection) -> None:
             ON download_coverage (field, ticker, start_date, end_date);
         """
     )
+    for table in ("short_interest", "market_caps"):
+        columns = {
+            row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+        }
+        if "industry" in columns:
+            connection.execute(f"ALTER TABLE {table} DROP COLUMN industry")
 
 
 def load_cached_securities(
@@ -971,14 +963,24 @@ def load_covered_tickers(
     """Return tickers with cached coverage encompassing a requested window."""
     with closing(sqlite3.connect(database_path)) as connection:
         initialize_database(connection)
-        rows = connection.execute(
-            """
-            SELECT ticker
-            FROM download_coverage
-            WHERE field = ? AND start_date <= ? AND end_date >= ?
-            """,
-            (field, start_date.isoformat(), end_date.isoformat()),
-        )
+        if field == MARKET_CAP_FIELD:
+            rows = connection.execute(
+                """
+                SELECT ticker
+                FROM download_coverage
+                WHERE field = ? AND start_date = ? AND end_date = ?
+                """,
+                (field, start_date.isoformat(), end_date.isoformat()),
+            )
+        else:
+            rows = connection.execute(
+                """
+                SELECT ticker
+                FROM download_coverage
+                WHERE field = ? AND start_date <= ? AND end_date >= ?
+                """,
+                (field, start_date.isoformat(), end_date.isoformat()),
+            )
         return {row[0] for row in rows}
 
 
@@ -1022,29 +1024,36 @@ def migrate_existing_download_coverage(
                 )
                 migrated += connection.total_changes - before
 
-            snapshot_row = connection.execute(
-                "SELECT MAX(date) FROM market_caps"
-            ).fetchone()
-            snapshot_date = snapshot_row[0] if snapshot_row else None
-            if snapshot_date != as_of_date.isoformat():
-                return migrated
-
-            point_fields = (
+            short_interest_start = as_of_date - timedelta(
+                days=SHORT_INTEREST_LOOKBACK_DAYS
+            )
+            before = connection.total_changes
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO download_coverage (
+                    field,
+                    ticker,
+                    start_date,
+                    end_date
+                )
+                SELECT ?, ticker, ?, ?
+                FROM short_interest
+                WHERE date BETWEEN ? AND ?
+                GROUP BY ticker
+                """,
                 (
                     SHORT_INTEREST_FIELD,
-                    "short_interest",
-                    as_of_date - timedelta(days=POINT_IN_TIME_LOOKBACK_DAYS),
-                ),
-                (
-                    MARKET_CAP_FIELD,
-                    "market_caps",
-                    as_of_date - timedelta(days=POINT_IN_TIME_LOOKBACK_DAYS),
+                    short_interest_start.isoformat(),
+                    as_of_date.isoformat(),
+                    short_interest_start.isoformat(),
+                    as_of_date.isoformat(),
                 ),
             )
-            for field, table, start_date in point_fields:
-                before = connection.total_changes
-                connection.execute(
-                    f"""
+            migrated += connection.total_changes - before
+
+            before = connection.total_changes
+            connection.execute(
+                """
                     INSERT OR IGNORE INTO download_coverage (
                         field,
                         ticker,
@@ -1052,18 +1061,18 @@ def migrate_existing_download_coverage(
                         end_date
                     )
                     SELECT ?, ticker, ?, ?
-                    FROM {table}
-                    WHERE date <= ?
+                    FROM market_caps
+                    WHERE date = ?
                     GROUP BY ticker
-                    """,
-                    (
-                        field,
-                        start_date.isoformat(),
-                        as_of_date.isoformat(),
-                        as_of_date.isoformat(),
-                    ),
-                )
-                migrated += connection.total_changes - before
+                """,
+                (
+                    MARKET_CAP_FIELD,
+                    as_of_date.isoformat(),
+                    as_of_date.isoformat(),
+                    as_of_date.isoformat(),
+                ),
+            )
+            migrated += connection.total_changes - before
     return migrated
 
 
@@ -1072,27 +1081,26 @@ def load_existing_short_interest(
     securities: Sequence[SecurityInfo],
     as_of_date: date,
 ) -> dict[str, ShortInterestRow]:
-    """Load the latest stored short-interest row for requested securities."""
+    """Load the latest short interest within 21 calendar days."""
     security_by_ticker = {security.ticker: security for security in securities}
     latest: dict[str, ShortInterestRow] = {}
-    start_date = as_of_date - timedelta(days=POINT_IN_TIME_LOOKBACK_DAYS)
+    start_date = as_of_date - timedelta(days=SHORT_INTEREST_LOOKBACK_DAYS)
     with closing(sqlite3.connect(database_path)) as connection:
         initialize_database(connection)
         rows = connection.execute(
             """
-            SELECT date, ticker, industry, short_interest_percent_float
+            SELECT date, ticker, short_interest_percent_float
             FROM short_interest
             WHERE date BETWEEN ? AND ?
             ORDER BY date DESC
             """,
             (start_date.isoformat(), as_of_date.isoformat()),
         )
-        for observation_date, ticker, industry, value in rows:
+        for observation_date, ticker, value in rows:
             if ticker in security_by_ticker and ticker not in latest:
                 latest[ticker] = ShortInterestRow(
                     observation_date=date.fromisoformat(observation_date),
                     ticker=ticker,
-                    industry=industry,
                     short_interest_percent_float=value,
                 )
     return latest
@@ -1103,27 +1111,24 @@ def load_existing_market_caps(
     securities: Sequence[SecurityInfo],
     as_of_date: date,
 ) -> dict[str, MarketCapRow]:
-    """Load the latest stored market-cap row for requested securities."""
+    """Load stored market caps for the requested as-of date."""
     security_by_ticker = {security.ticker: security for security in securities}
     latest: dict[str, MarketCapRow] = {}
-    start_date = as_of_date - timedelta(days=POINT_IN_TIME_LOOKBACK_DAYS)
     with closing(sqlite3.connect(database_path)) as connection:
         initialize_database(connection)
         rows = connection.execute(
             """
-            SELECT date, ticker, industry, market_cap
+            SELECT date, ticker, market_cap
             FROM market_caps
-            WHERE date BETWEEN ? AND ?
-            ORDER BY date DESC
+            WHERE date = ?
             """,
-            (start_date.isoformat(), as_of_date.isoformat()),
+            (as_of_date.isoformat(),),
         )
-        for observation_date, ticker, industry, value in rows:
+        for observation_date, ticker, value in rows:
             if ticker in security_by_ticker and ticker not in latest:
                 latest[ticker] = MarketCapRow(
                     observation_date=date.fromisoformat(observation_date),
                     ticker=ticker,
-                    industry=industry,
                     market_cap=value,
                 )
     return latest
@@ -1161,17 +1166,15 @@ def store_rows(
             )
             connection.executemany(
                 """
-                INSERT INTO market_caps (date, ticker, industry, market_cap)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO market_caps (date, ticker, market_cap)
+                VALUES (?, ?, ?)
                 ON CONFLICT (date, ticker) DO UPDATE SET
-                    industry = excluded.industry,
                     market_cap = excluded.market_cap
                 """,
                 (
                     (
                         row.observation_date.isoformat(),
                         row.ticker,
-                        row.industry,
                         row.market_cap,
                     )
                     for row in market_cap_rows
@@ -1182,19 +1185,16 @@ def store_rows(
                 INSERT INTO short_interest (
                     date,
                     ticker,
-                    industry,
                     short_interest_percent_float
                 )
-                VALUES (?, ?, ?, ?)
+                VALUES (?, ?, ?)
                 ON CONFLICT (date, ticker) DO UPDATE SET
-                    industry = excluded.industry,
                     short_interest_percent_float = excluded.short_interest_percent_float
                 """,
                 (
                     (
                         row.observation_date.isoformat(),
                         row.ticker,
-                        row.industry,
                         row.short_interest_percent_float,
                     )
                     for row in short_interest_rows
@@ -1248,7 +1248,6 @@ def store_download_batch(
                 ShortInterestRow(
                     observation_date,
                     security.ticker,
-                    security.industry,
                     value,
                 )
             )
@@ -1257,7 +1256,6 @@ def store_download_batch(
                 MarketCapRow(
                     observation_date,
                     security.ticker,
-                    security.industry,
                     value,
                 )
             )

@@ -201,8 +201,7 @@ The script stores data in `bloomberg_history.db` by default. It retrieves:
   five years.
 - `SI_PERCENT_EQUITY_FLOAT` from the most recent available date within the
   preceding 21 calendar days.
-- Market capitalization from the most recent available date within the
-  preceding 21 calendar days.
+- Market capitalization for the rebalance date.
 - Bloomberg ticker and BICS industry metadata.
 
 The cache checks existing database coverage before making Bloomberg requests.

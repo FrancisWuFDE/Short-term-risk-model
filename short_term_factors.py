@@ -11,7 +11,7 @@ from typing import Literal, Sequence
 import pandas as pd
 
 from bbg_cache import (
-    POINT_IN_TIME_LOOKBACK_DAYS,
+    SHORT_INTEREST_LOOKBACK_DAYS,
     TICKER_PATTERN,
     _read_workbook_cells,
     historical_price_windows,
@@ -152,12 +152,11 @@ def load_latest_market_caps(
     tickers: pd.Index,
     as_of_date: date,
 ) -> pd.Series:
-    """Return each ticker's latest market cap through the rebalance date."""
+    """Return each ticker's market cap on the rebalance date."""
     query = """
         SELECT ticker, market_cap
         FROM market_caps
-        WHERE date <= ?
-        ORDER BY date DESC
+        WHERE date = ?
     """
     connection = sqlite3.connect(database_path)
     market_caps = pd.read_sql_query(
@@ -178,8 +177,8 @@ def load_latest_short_interest(
     tickers: pd.Index,
     as_of_date: date,
 ) -> pd.Series:
-    """Return recent short interest percent of float by ticker."""
-    start_date = as_of_date - timedelta(days=POINT_IN_TIME_LOOKBACK_DAYS)
+    """Return the latest short interest within 21 calendar days."""
+    start_date = as_of_date - timedelta(days=SHORT_INTEREST_LOOKBACK_DAYS)
     query = """
         SELECT ticker, short_interest_percent_float
         FROM short_interest
