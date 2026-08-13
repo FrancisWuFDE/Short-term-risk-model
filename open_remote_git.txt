@@ -1,0 +1,4 @@
+Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process
+.venv\Scripts\Activate.ps1
+$projectGit = "C:\Users\OTC-User1\OTCProjects\Francis\git\cmd\git.exe"
+Set-Alias -Name git -Value $projectGit
