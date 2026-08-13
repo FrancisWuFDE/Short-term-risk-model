@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sqlite3
+import sys
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Sequence
@@ -34,6 +35,29 @@ FACTOR_ROBUST_Z = {
 def _ticker(value: str) -> str:
     """Return the base ticker from CSV or Bloomberg ticker text."""
     return value.strip().upper().split()[0]
+
+
+def _warn_missing_data(
+    label: str,
+    values: pd.Series,
+    required_tickers: pd.Index,
+    preview_size: int = 20,
+) -> None:
+    """Warn about required tickers with no input value."""
+    required = required_tickers.drop_duplicates()
+    available = values[values.notna()].index
+    missing = required[~required.isin(available)]
+    if missing.empty:
+        return
+
+    preview = ", ".join(map(str, missing[:preview_size]))
+    remainder = len(missing) - preview_size
+    suffix = f", and {remainder:,} more" if remainder > 0 else ""
+    print(
+        f"WARNING: Missing {label} for {len(missing):,} of "
+        f"{len(required):,} required tickers: {preview}{suffix}.",
+        file=sys.stderr,
+    )
 
 
 def robust_standard_deviation(values: pd.Series) -> float:
@@ -417,12 +441,18 @@ def calculate_factor_exposure_summary(
     ticker_selector = pd.Series(index=all_tickers, dtype=float)
 
     prices = load_latest_prices(database_path, shares.index, rebalance_date)
+    _warn_missing_data("portfolio prices", prices, shares.index)
     portfolio_weights = calculate_portfolio_weights(shares, prices)
     print(f"Portfolio price coverage: {len(prices)}/{len(shares)}")
     market_caps = load_latest_market_caps(
         database_path,
         benchmark_tickers,
         rebalance_date,
+    )
+    _warn_missing_data(
+        "benchmark market caps",
+        market_caps,
+        benchmark_tickers,
     )
 
     raw_factors = {
@@ -461,6 +491,16 @@ def calculate_factor_exposure_summary(
 
     rows = []
     for factor, raw_values in raw_factors.items():
+        _warn_missing_data(
+            f"{factor} benchmark data",
+            raw_values,
+            benchmark_tickers,
+        )
+        _warn_missing_data(
+            f"{factor} portfolio data",
+            raw_values,
+            portfolio_weights.index,
+        )
         trimmed = winsorize_factor(
             raw_values,
             factor=factor,
