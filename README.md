@@ -231,7 +231,18 @@ Run:
 python short_term_factors.py YYYYMMDD
 ```
 
-The script automatically loads:
+`YYYYMMDD` is the return date. The script finds the latest price date before
+it and uses that as the exposure/rebalance date. For example, a return date of
+`20260130` uses the portfolio and estimation-universe files dated `20260129`.
+
+For a portfolio file named with a different prefix, such as
+`my_portfolio_YYYYMMDD.csv`, run:
+
+```powershell
+python short_term_factors.py YYYYMMDD --prefix my_portfolio
+```
+
+Using the inferred exposure date, the script automatically loads:
 
 - `port_data/US_live_port_YYYYMMDD.csv` for portfolio positions;
 - `port_data/estimation_universe_YYYYMMDD.xlsx` for benchmark tickers; and
@@ -251,7 +262,82 @@ universe, and shifted so that the cap-weighted benchmark exposure is zero. The
 portfolio exposure is the sum of each normalized stock exposure multiplied by
 its portfolio weight.
 
+To test whether each portfolio's mean factor exposure is statistically
+different from zero using the exposure tables already saved in the log, run:
+
+```powershell
+python t_test.py
+```
+
+The script parses every exposure table in
+`port_outputs/factor_exposures.log` as one time-series observation and uses a
+Newey-West standard error to account for serial correlation. Use `--log` to
+select another log. Results and the parsed exposure history can be saved with
+`--output` and `--history-output`. Use a materially longer history than a few
+observations before interpreting the p-values.
+
+To regress the dated portfolio returns on each logged factor exposure and
+report the univariate R-squared values, run:
+
+```powershell
+python r_squared.py
+```
+
+This requires exposure log entries produced by the updated
+`short_term_factors.py`, including both exposure and return dates. The script
+calculates gross-normalized portfolio returns from the dated holdings and
+cached prices. Use `--output` to save the regression results and
+`--returns-output` to save the aligned portfolio-return history.
+
+## GARCH portfolio-volatility forecast
+
+Install the dependencies and generate two years of no-lookahead GARCH(1,1)
+forecasts from four years of SPY returns using Student-t innovations:
+
+```powershell
+pip install -r requirements.txt
+python garch.py
+```
+
+Use `--as-of-date YYYYMMDD` to set the inclusive end date. The portfolio model
+remains available with `--source portfolio`, and a return CSV containing
+`return_date` and `portfolio_return` can be supplied with `--returns-file`.
+Each rolling forecast uses only the preceding two calendar years. Results are
+saved by default to `port_outputs/garch_volatility_forecasts.csv`. Use
+`--mode latest` for a single latest forecast, or change the rolling windows
+with `--training-years` and `--forecast-years`.
+
+## SPY option-implied volatility
+
+Download current SPY option bid/ask prices and estimate constant-maturity
+volatility for one day, one month, and one year:
+
+```powershell
+python spy_option_volatility.py
+```
+
+The script calculates Black-Scholes-Merton implied volatility from liquid ATM
+option midpoints and interpolates total variance between expirations. It
+reports annualized implied volatility and the one-standard-deviation expected
+move over each horizon. Use `--output` to save the forecasts and
+`--options-output` to retain the selected option prices and calculated IVs.
+
 ## 8. Validate and retain the results
+
+To estimate next-day factor returns from the normalized stock exposures, run:
+
+```powershell
+python factor_returns.py YYYYMMDD
+```
+
+`YYYYMMDD` is the return date. The script uses the latest stored price date
+before it as the exposure date, loads that date's estimation-universe file,
+and requires prices on the exact requested return date. To save the regression
+coefficients:
+
+```powershell
+python factor_returns.py YYYYMMDD --output results/factor_returns_YYYYMMDD.csv
+```
 
 Review the console output before using the results:
 

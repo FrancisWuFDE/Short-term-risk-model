@@ -9,6 +9,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Literal, Sequence
 
+import numpy as np
 import pandas as pd
 
 from bbg_cache import (
@@ -29,6 +30,7 @@ FACTOR_ROBUST_Z = {
     "industry_momentum": 5.0,
     "short_interest": 5.0,
     "downside_risk": 5.0,
+    "size": 5.0,
 }
 
 
@@ -223,6 +225,11 @@ def load_latest_short_interest(
     return short_interest.set_index("ticker")[
         "short_interest_percent_float"
     ].astype(float)
+
+
+def get_size(market_caps: pd.Series) -> pd.Series:
+    """Return the natural logarithm of market capitalization."""
+    return np.log(market_caps).rename("size")
 
 
 def calculate_portfolio_weights(
@@ -424,37 +431,19 @@ def get_industry_momentum(
     return momentum.rename("industry_momentum")
 
 
-def calculate_factor_exposure_summary(
+def calculate_raw_factor_values(
+    tickers: pd.Index,
+    estimation_index: pd.Index,
     rebalance_date: date,
-    port_data_dir: str | Path = "port_data",
     database_path: str | Path = "bloomberg_history.db",
-) -> pd.DataFrame:
-    """Calculate portfolio and benchmark exposures for all factors."""
-    date_stamp = rebalance_date.strftime("%Y%m%d")
-    data_dir = Path(port_data_dir)
-    portfolio_path = data_dir / f"US_live_port_{date_stamp}.csv"
-    universe_path = data_dir / f"estimation_universe_{date_stamp}.xlsx"
-
-    _, shares = load_portfolio_positions(portfolio_path)
-    benchmark_tickers = load_benchmark_tickers(universe_path)
-    all_tickers = benchmark_tickers.append(shares.index).drop_duplicates()
-    ticker_selector = pd.Series(index=all_tickers, dtype=float)
-
-    prices = load_latest_prices(database_path, shares.index, rebalance_date)
-    _warn_missing_data("portfolio prices", prices, shares.index)
-    portfolio_weights = calculate_portfolio_weights(shares, prices)
-    print(f"Portfolio price coverage: {len(prices)}/{len(shares)}")
+) -> tuple[dict[str, pd.Series], pd.Series]:
+    """Calculate raw factor descriptors and market caps for a stock universe."""
+    ticker_selector = pd.Series(index=tickers, dtype=float)
     market_caps = load_latest_market_caps(
         database_path,
-        benchmark_tickers,
+        tickers,
         rebalance_date,
     )
-    _warn_missing_data(
-        "benchmark market caps",
-        market_caps,
-        benchmark_tickers,
-    )
-
     raw_factors = {
         "one_day_reversal": get_one_day_reversal(
             ticker_selector,
@@ -473,21 +462,85 @@ def calculate_factor_exposure_summary(
         ),
         "industry_momentum": get_industry_momentum(
             ticker_selector,
-            market_caps,
+            market_caps.reindex(estimation_index),
             rebalance_date,
             database_path,
         ),
         "short_interest": load_latest_short_interest(
             database_path,
-            all_tickers,
+            tickers,
             rebalance_date,
-        ).reindex(all_tickers),
+        ).reindex(tickers),
         "downside_risk": get_downside_risk(
             ticker_selector,
             rebalance_date,
             database_path,
         ),
+        "size": get_size(market_caps).reindex(tickers),
     }
+    return raw_factors, market_caps
+
+
+def calculate_normalized_factor_exposures(
+    tickers: pd.Index,
+    estimation_index: pd.Index,
+    rebalance_date: date,
+    database_path: str | Path = "bloomberg_history.db",
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Return normalized stock-level exposures and corresponding market caps."""
+    raw_factors, market_caps = calculate_raw_factor_values(
+        tickers,
+        estimation_index,
+        rebalance_date,
+        database_path,
+    )
+    benchmark_caps = market_caps.reindex(estimation_index)
+    exposures = {}
+    for factor, raw_values in raw_factors.items():
+        trimmed = winsorize_factor(
+            raw_values,
+            factor=factor,
+            estimation_index=estimation_index,
+        )
+        exposures[factor] = normalize_factor_exposures(
+            trimmed,
+            benchmark_caps,
+            estimation_index=estimation_index,
+        )
+    return pd.DataFrame(exposures).reindex(tickers), market_caps
+
+
+def calculate_factor_exposure_summary(
+    rebalance_date: date,
+    port_data_dir: str | Path = "port_data",
+    database_path: str | Path = "bloomberg_history.db",
+    portfolio_prefix: str = "US_live_port",
+) -> pd.DataFrame:
+    """Calculate portfolio and benchmark exposures for all factors."""
+    date_stamp = rebalance_date.strftime("%Y%m%d")
+    data_dir = Path(port_data_dir)
+    portfolio_path = data_dir / f"{portfolio_prefix}_{date_stamp}.csv"
+    universe_path = data_dir / f"estimation_universe_{date_stamp}.xlsx"
+
+    _, shares = load_portfolio_positions(portfolio_path)
+    benchmark_tickers = load_benchmark_tickers(universe_path)
+    all_tickers = benchmark_tickers.append(shares.index).drop_duplicates()
+
+    prices = load_latest_prices(database_path, shares.index, rebalance_date)
+    _warn_missing_data("portfolio prices", prices, shares.index)
+    portfolio_weights = calculate_portfolio_weights(shares, prices)
+    print(f"Portfolio price coverage: {len(prices)}/{len(shares)}")
+    raw_factors, market_caps = calculate_raw_factor_values(
+        all_tickers,
+        benchmark_tickers,
+        rebalance_date,
+        database_path,
+    )
+    _warn_missing_data(
+        "benchmark market caps",
+        market_caps,
+        benchmark_tickers,
+    )
 
     rows = []
     for factor, raw_values in raw_factors.items():
@@ -508,7 +561,7 @@ def calculate_factor_exposure_summary(
         )
         exposures = normalize_factor_exposures(
             trimmed,
-            market_caps,
+            market_caps.reindex(benchmark_tickers),
             estimation_index=benchmark_tickers,
         )
         benchmark_exposures = exposures.reindex(benchmark_tickers)
@@ -529,14 +582,49 @@ def calculate_factor_exposure_summary(
     return pd.DataFrame(rows).set_index("factor")
 
 
-def main(arguments: Sequence[str] | None = None) -> int:
-    """Run factor exposures for a YYYYMMDD rebalance date."""
-    parser = argparse.ArgumentParser()
-    parser.add_argument("date", help="Rebalance date in YYYYMMDD format.")
-    options = parser.parse_args(arguments)
-    rebalance_date = datetime.strptime(options.date, "%Y%m%d").date()
+def get_previous_price_date(
+    database_path: str | Path,
+    return_date: date,
+) -> date:
+    """Return the latest stored price date before the requested return date."""
+    connection = sqlite3.connect(database_path)
+    try:
+        row = connection.execute(
+            "SELECT MAX(date) FROM prices WHERE date < ?",
+            (return_date.isoformat(),),
+        ).fetchone()
+    finally:
+        connection.close()
 
-    exposures = calculate_factor_exposure_summary(rebalance_date)
+    if row is None or row[0] is None:
+        raise ValueError(f"No price date exists before {return_date}.")
+    return date.fromisoformat(row[0])
+
+
+def main(arguments: Sequence[str] | None = None) -> int:
+    """Run factor exposures for a YYYYMMDD return date."""
+    parser = argparse.ArgumentParser()
+    parser.add_argument("date", help="Return date in YYYYMMDD format.")
+    parser.add_argument(
+        "--prefix",
+        default="US_live_port",
+        help=(
+            "Portfolio filename prefix before _YYYYMMDD.csv "
+            "(default: US_live_port)."
+        ),
+    )
+    options = parser.parse_args(arguments)
+    return_date = datetime.strptime(options.date, "%Y%m%d").date()
+    exposure_date = get_previous_price_date(
+        "bloomberg_history.db",
+        return_date,
+    )
+
+    exposures = calculate_factor_exposure_summary(
+        exposure_date,
+        portfolio_prefix=options.prefix,
+    )
+    print(f"Exposure date: {exposure_date}; return date: {return_date}.")
     print(exposures.to_string(float_format=lambda value: f"{value:.8f}"))
     return 0
 
