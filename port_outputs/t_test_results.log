@@ -1,0 +1,9 @@
+                    mean_exposure standard_error      t_stat    p_value confidence_lower confidence_upper significant_95pct observations max_lags
+factor                                                                                                                                           
+one_day_reversal      -0.00410572     0.00245667 -1.67125661 0.19326409      -0.01192394       0.00371249             False            4        1
+short_term_reversal    0.02461243     0.00134294 18.32731202 0.00035444       0.02033861       0.02888626              True            4        1
+seasonality            0.00858261     0.00314874  2.72572859 0.07219992      -0.00143808       0.01860330             False            4        1
+industry_momentum     -0.01403900     0.00592845 -2.36807349 0.09867582      -0.03290597       0.00482797             False            4        1
+short_interest         0.01831558     0.00318857  5.74413700 0.01047926       0.00816813       0.02846304              True            4        1
+downside_risk          0.00577465     0.00161607  3.57326284 0.03746512       0.00063159       0.01091771              True            4        1
+size                  -0.01152063     0.00200153 -5.75592471 0.01041930      -0.01789038      -0.00515088              True            4        1

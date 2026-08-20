@@ -1,0 +1,30 @@
+Exposure date: 2026-01-28; return date: 2026-01-29; observations: 2,917; weighted R-squared: 0.088763
+                         return  return_percent
+market              -0.00214124     -0.21412364
+one_day_reversal     0.00091520      0.09151967
+short_term_reversal -0.00361609     -0.36160890
+seasonality          0.00413114      0.41311419
+industry_momentum   -0.00258840     -0.25884025
+short_interest      -0.00189862     -0.18986171
+downside_risk       -0.00971925     -0.97192506
+size                -0.00343886     -0.34388643
+Exposure date: 2026-01-29; return date: 2026-01-30; observations: 2,913; weighted R-squared: 0.204169
+                         return  return_percent
+market              -0.00837507     -0.83750702
+one_day_reversal     0.00065778      0.06577832
+short_term_reversal  0.00488122      0.48812224
+seasonality          0.00021069      0.02106890
+industry_momentum   -0.00528274     -0.52827352
+short_interest      -0.00195900     -0.19590042
+downside_risk       -0.01225011     -1.22501095
+size                -0.00087735     -0.08773516
+Exposure date: 2026-01-30; return date: 2026-02-02; observations: 2,912; weighted R-squared: 0.069491
+                         return  return_percent
+market               0.00598396      0.59839563
+one_day_reversal    -0.00399170     -0.39916992
+short_term_reversal -0.00254265     -0.25426464
+seasonality         -0.00101070     -0.10106973
+industry_momentum    0.00328961      0.32896066
+short_interest      -0.00123209     -0.12320927
+downside_risk       -0.00224362     -0.22436218
+size                -0.00313868     -0.31386825

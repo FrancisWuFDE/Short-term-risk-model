@@ -1,0 +1,33 @@
+Portfolio price coverage: 1999/2016
+Exposure date: 2026-01-28; return date: 2026-01-29.
+                     portfolio_exposure  benchmark_exposure
+factor                                                     
+one_day_reversal            -0.00543174          0.00000000
+short_term_reversal          0.02764247          0.00000000
+seasonality                  0.00487023          0.00000000
+industry_momentum           -0.01460611         -0.00000000
+short_interest               0.01955386          0.00000000
+downside_risk                0.00677032          0.00000000
+size                        -0.01501056         -0.00000000
+Portfolio price coverage: 1996/2013
+Exposure date: 2026-01-29; return date: 2026-01-30.
+                     portfolio_exposure  benchmark_exposure
+factor                                                     
+one_day_reversal            -0.00117673         -0.00000000
+short_term_reversal          0.01693156          0.00000000
+seasonality                  0.00677663          0.00000000
+industry_momentum           -0.02707005          0.00000000
+short_interest               0.01440353         -0.00000000
+downside_risk                0.01005711          0.00000000
+size                        -0.01476287         -0.00000000
+Portfolio price coverage: 1995/2012
+Exposure date: 2026-01-30; return date: 2026-02-02.
+                     portfolio_exposure  benchmark_exposure
+factor                                                     
+one_day_reversal             0.00325509         -0.00000000
+short_term_reversal          0.03019555          0.00000000
+seasonality                  0.00138916          0.00000000
+industry_momentum           -0.02014586          0.00000000
+short_interest               0.00918382          0.00000000
+downside_risk                0.00462543         -0.00000000
+size                        -0.00963842          0.00000000
